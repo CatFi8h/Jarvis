@@ -1,0 +1,6 @@
+# OPTIONAL — leave this as-is unless the endpoint starts requiring auth.
+# The bot works without it (it builds the POST to /api/ticket-search from .env).
+#
+# If needed: Chrome DevTools -> Network -> the "ticket-search" request ->
+# right-click -> "Copy as cURL" -> replace this whole file with it.
+# The bot forces your DEPARTURE_DATE into the request automatically.
