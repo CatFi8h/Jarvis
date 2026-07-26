@@ -1,4 +1,4 @@
-module nike-parser
+module jarvis-bot
 
 go 1.26.1
 

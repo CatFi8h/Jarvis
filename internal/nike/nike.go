@@ -1,31 +1,22 @@
-// nike-monitor polls Nike's discover API for a product group and sends a
-// Telegram notification when a target size comes back in stock.
+// Package nike is the Nike stock parser: it polls Nike's discover availability
+// API for a product group and alerts subscribed chats when a target size comes
+// back in stock.
 //
 // Endpoint (one call gives sizes + availability for all colorways in the group):
 //
 //	GET https://api.nike.com/discover/product_details_availability/v1/
 //	    marketplace/{mp}/language/{lang}/consumerChannelId/{ch}/groupKey/{key}
 //
-// Response shape:
-//
-//	{"sizes":[{"label":"10","localizedLabel":"M 10 / W 11.5",
-//	           "productCode":"IF2857-600","merchSkuId":"...",
-//	           "availability":{"isAvailable":true,"ship":"HIGH"}}, ...]}
-//
 // Config (env vars):
 //
-//	GROUP_KEY           required, e.g. GbnAW5Hb (last path segment of the
-//	                    availability URL in DevTools)
-//	STYLE_COLOR         required, e.g. IF2857-600 (matched against productCode)
-//	TARGET_SIZES        required, comma-separated "label" values, e.g. "10,10.5",
-//	                    or "*" for all
-//	TELEGRAM_BOT_TOKEN  required
-//	TELEGRAM_CHAT_ID    required
-//	MARKETPLACE         default US
-//	LANGUAGE            default en
-//	POLL_INTERVAL       default 10m
-//	NOTIFY_ON_START     default true
-package main
+//	GROUP_KEY       required, e.g. GbnAW5Hb (last path segment of the URL in DevTools)
+//	STYLE_COLOR     required, e.g. IF2857-600 (matched against productCode)
+//	TARGET_SIZES    required, comma-separated labels e.g. "10,10.5", or "*" for all
+//	MARKETPLACE     default US
+//	LANGUAGE        default en
+//	POLL_INTERVAL   default 10m
+//	NOTIFY_ON_START default true
+package nike
 
 import (
 	"context"
@@ -38,16 +29,17 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"sort"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
-	"github.com/joho/godotenv"
+	"jarvis-bot/internal/subs"
+	"jarvis-bot/internal/tg"
 )
 
 const (
+	name         = "nike"
 	apiBase      = "https://api.nike.com/discover/product_details_availability/v1"
 	webChannelID = "d9a5bc42-4b9c-4976-858a-f159cf99c647" // nike.com web channel
 	userAgent    = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -65,20 +57,15 @@ type config struct {
 	Marketplace   string
 	Language      string
 	Interval      time.Duration
-	TgToken       string
-	TgChatID      string
 	NotifyOnStart bool
 }
 
 func loadConfig() (config, error) {
-	_ = godotenv.Load()
 	c := config{
 		GroupKey:      os.Getenv("GROUP_KEY"),
 		StyleColor:    strings.ToUpper(os.Getenv("STYLE_COLOR")),
 		Marketplace:   envOr("MARKETPLACE", "US"),
 		Language:      envOr("LANGUAGE", "en"),
-		TgToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
-		TgChatID:      os.Getenv("TELEGRAM_CHAT_ID"),
 		NotifyOnStart: envOr("NOTIFY_ON_START", "true") == "true",
 	}
 	if c.GroupKey == "" {
@@ -86,9 +73,6 @@ func loadConfig() (config, error) {
 	}
 	if c.StyleColor == "" {
 		return c, errors.New("STYLE_COLOR is required (e.g. IF2857-600)")
-	}
-	if c.TgToken == "" || c.TgChatID == "" {
-		return c, errors.New("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required")
 	}
 
 	sizes := envOr("TARGET_SIZES", "")
@@ -119,7 +103,7 @@ func envOr(key, def string) string {
 	return def
 }
 
-// ---------- Nike API ----------
+// ---------- Nike API types ----------
 
 type availResponse struct {
 	GroupKey string      `json:"groupKey"`
@@ -151,12 +135,10 @@ func parseSizes(body []byte, styleColor string) ([]sizeStatus, error) {
 	}
 
 	var out []sizeStatus
-	seen := map[string]bool{}
 	for _, s := range ar.Sizes {
 		if !strings.EqualFold(s.ProductCode, styleColor) {
 			continue
 		}
-		seen[s.ProductCode] = true
 		out = append(out, sizeStatus{
 			Size:      s.Label,
 			Localized: s.LocalizedLabel,
@@ -178,16 +160,42 @@ func parseSizes(body []byte, styleColor string) ([]sizeStatus, error) {
 
 // ---------- monitor ----------
 
-type monitor struct {
+// Monitor is the Nike parser. It implements parser.Parser.
+type Monitor struct {
 	cfg    config
 	client *http.Client
+	reg    *subs.Registry
+	tg     *tg.Telegram
 
+	mu       sync.Mutex            // guards prev, failures, warned, stats
 	prev     map[string]sizeStatus // last known state per size label
 	failures int
 	warned   bool
+
+	checks     int
+	lastCheck  time.Time
+	lastResult string
 }
 
-func (m *monitor) fetch(ctx context.Context) ([]sizeStatus, error) {
+// New builds the Nike monitor, loading its config from the environment. It
+// returns nil (with error) if required config is missing, so the bot can skip
+// this parser and still run others.
+func New(reg *subs.Registry, t *tg.Telegram) (*Monitor, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, err
+	}
+	return &Monitor{
+		cfg:    cfg,
+		client: &http.Client{Timeout: 30 * time.Second},
+		reg:    reg,
+		tg:     t,
+	}, nil
+}
+
+func (m *Monitor) Name() string { return name }
+
+func (m *Monitor) fetch(ctx context.Context) ([]sizeStatus, error) {
 	u := fmt.Sprintf("%s/marketplace/%s/language/%s/consumerChannelId/%s/groupKey/%s",
 		apiBase, m.cfg.Marketplace, m.cfg.Language, webChannelID, url.PathEscape(m.cfg.GroupKey))
 
@@ -217,18 +225,33 @@ func (m *monitor) fetch(ctx context.Context) ([]sizeStatus, error) {
 	return parseSizes(body, m.cfg.StyleColor)
 }
 
-func (m *monitor) watched(size string) bool {
+func (m *Monitor) watched(size string) bool {
 	return m.cfg.TargetSizes == nil || m.cfg.TargetSizes[size]
 }
 
-func (m *monitor) poll(ctx context.Context) {
+// broadcast sends an alert to every chat subscribed to nike (respecting mutes).
+func (m *Monitor) broadcast(text string) {
+	m.tg.Broadcast(m.reg.Targets(name, true), text)
+}
+
+// poll performs one diffing check (from the Run loop) and alerts on restocks.
+func (m *Monitor) poll(ctx context.Context) {
 	statuses, err := m.fetch(ctx)
+
+	m.mu.Lock()
+	m.checks++
+	m.lastCheck = time.Now()
 	if err != nil {
 		m.failures++
-		log.Printf("poll failed (%d in a row): %v", m.failures, err)
-		if m.failures >= maxConsecutiveFailures && !m.warned {
+		m.lastResult = "fetch error: " + err.Error()
+		log.Printf("[nike] poll failed (%d in a row): %v", m.failures, err)
+		firedWarn := m.failures >= maxConsecutiveFailures && !m.warned
+		if firedWarn {
 			m.warned = true
-			m.notify(ctx, fmt.Sprintf("⚠️ nike-monitor: %d polls in a row failed, last error: %v", m.failures, err))
+		}
+		m.mu.Unlock()
+		if firedWarn {
+			m.broadcast(fmt.Sprintf("⚠️ nike: %d polls in a row failed, last error: %v", maxConsecutiveFailures, err))
 		}
 		return
 	}
@@ -238,13 +261,17 @@ func (m *monitor) poll(ctx context.Context) {
 	for _, s := range statuses {
 		curr[s.Size] = s
 	}
+	m.lastResult = strings.ReplaceAll(summarize(statuses, m.watched), "\n", " | ")
 
 	if m.prev == nil {
 		m.prev = curr
-		log.Printf("baseline: %s", strings.ReplaceAll(summarize(statuses, m.watched), "\n", " | "))
-		if m.cfg.NotifyOnStart {
-			m.notify(ctx, fmt.Sprintf("👟 Monitoring %s\nWatching sizes: %s\nCurrent stock:\n%s",
-				m.cfg.StyleColor, m.targetsLabel(), summarize(statuses, m.watched)))
+		notifyOnStart := m.cfg.NotifyOnStart
+		style, label := m.cfg.StyleColor, m.targetsLabel()
+		summary := summarize(statuses, m.watched)
+		m.mu.Unlock()
+		log.Printf("[nike] baseline: %s", strings.ReplaceAll(summary, "\n", " | "))
+		if notifyOnStart {
+			m.broadcast(fmt.Sprintf("👟 Monitoring %s\nWatching sizes: %s\nCurrent stock:\n%s", style, label, summary))
 		}
 		return
 	}
@@ -263,24 +290,99 @@ func (m *monitor) poll(ctx context.Context) {
 		}
 	}
 	m.prev = curr
+	style := m.cfg.StyleColor
+	m.mu.Unlock()
 
 	if len(restocked) > 0 {
 		sort.Strings(restocked)
-		m.notify(ctx, fmt.Sprintf("🔥 BACK IN STOCK — %s\n%s\nhttps://www.nike.com/t/-/%s",
-			m.cfg.StyleColor, strings.Join(restocked, "\n"), m.cfg.StyleColor))
+		m.broadcast(fmt.Sprintf("🔥 BACK IN STOCK — %s\n%s\nhttps://www.nike.com/t/-/%s",
+			style, strings.Join(restocked, "\n"), style))
 	}
 	if len(gone) > 0 {
 		sort.Strings(gone)
-		log.Printf("went out of stock: %s", strings.Join(gone, ", "))
+		log.Printf("[nike] went out of stock: %s", strings.Join(gone, ", "))
 	}
 }
 
-func (m *monitor) targetsLabel() string {
+// snapshot fetches current stock without touching the restock-diffing baseline;
+// used for /nike_start and /nike_check replies to a single chat.
+func (m *Monitor) snapshot(ctx context.Context) string {
+	statuses, err := m.fetch(ctx)
+	if err != nil {
+		return "⚠️ nike check failed: " + err.Error()
+	}
+	return summarize(statuses, m.watched)
+}
+
+// Run is the independent poll loop: immediate check, then jittered interval.
+func (m *Monitor) Run(ctx context.Context) {
+	log.Printf("[nike] watching group %s / style %s, sizes: %s, every %s",
+		m.cfg.GroupKey, m.cfg.StyleColor, m.targetsLabel(), m.cfg.Interval)
+	m.poll(ctx)
+	for {
+		jitter := time.Duration(rand.Int63n(int64(m.cfg.Interval)/5)) - m.cfg.Interval/10
+		select {
+		case <-ctx.Done():
+			log.Println("[nike] shutting down")
+			return
+		case <-time.After(m.cfg.Interval + jitter):
+			m.poll(ctx)
+		}
+	}
+}
+
+// Handle processes /nike_<action> commands for one chat.
+func (m *Monitor) Handle(chatID, action, args string) string {
+	switch action {
+	case "start":
+		m.reg.Subscribe(chatID, name)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return fmt.Sprintf("👟 Subscribed to Nike. Watching %s (sizes: %s) every %s.\nCurrent stock:\n%s",
+			m.cfg.StyleColor, m.targetsLabel(), m.cfg.Interval, m.snapshot(ctx))
+	case "stop":
+		m.reg.Mute(chatID, name, true)
+		return "🔕 Nike alerts paused for this chat. Send /nike_continue to resume."
+	case "continue":
+		m.reg.Mute(chatID, name, false)
+		return "🔔 Nike alerts resumed."
+	case "status":
+		return m.StatusLine(chatID)
+	case "check":
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return "Checking Nike now…\n" + m.snapshot(ctx)
+	default:
+		return ""
+	}
+}
+
+// StatusLine reports the Nike parser state for a chat.
+func (m *Monitor) StatusLine(chatID string) string {
+	m.mu.Lock()
+	checks, last, res := m.checks, m.lastCheck, m.lastResult
+	m.mu.Unlock()
+	when := "never"
+	if !last.IsZero() {
+		when = last.Format("15:04:05") + fmt.Sprintf(" (%s ago)", time.Since(last).Round(time.Second))
+	}
+	if res == "" {
+		res = "—"
+	}
+	p := m.reg.Get(chatID, name)
+	return fmt.Sprintf("👟 Nike — %s (sizes: %s)\nChecks: %d\nLast: %s\nStock: %s\nYour subscription: %s | alerts: %s",
+		m.cfg.StyleColor, m.targetsLabel(), checks, when, res,
+		onoff(p.Subscribed), onoff(p.Subscribed && !p.Muted))
+}
+
+func (m *Monitor) targetsLabel() string {
 	if m.cfg.TargetSizes == nil {
 		return "all"
 	}
 	return strings.Join(sortedKeys(m.cfg.TargetSizes), ", ")
 }
+
+// ---------- helpers ----------
 
 func summarize(statuses []sizeStatus, watched func(string) bool) string {
 	var b strings.Builder
@@ -300,34 +402,12 @@ func summarize(statuses []sizeStatus, watched func(string) bool) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// ---------- telegram ----------
-
-func (m *monitor) notify(ctx context.Context, text string) {
-	api := "https://api.telegram.org/bot" + m.cfg.TgToken + "/sendMessage"
-	form := url.Values{
-		"chat_id":                  {m.cfg.TgChatID},
-		"text":                     {text},
-		"disable_web_page_preview": {"true"},
+func onoff(on bool) string {
+	if on {
+		return "on"
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api, strings.NewReader(form.Encode()))
-	if err != nil {
-		log.Printf("telegram: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := m.client.Do(req)
-	if err != nil {
-		log.Printf("telegram: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
-		log.Printf("telegram: HTTP %d: %s", resp.StatusCode, string(body))
-	}
+	return "off"
 }
-
-// ---------- helpers ----------
 
 func truncate(s string, n int) string {
 	if len(s) <= n {
@@ -362,39 +442,4 @@ func sizeLess(a, b string) bool {
 		return fa < fb
 	}
 	return a < b
-}
-
-// ---------- main ----------
-
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-	log.SetPrefix("[nike-monitor] ")
-
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	m := &monitor{
-		cfg:    cfg,
-		client: &http.Client{Timeout: 30 * time.Second},
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	log.Printf("watching group %s / style %s, sizes: %s, every %s",
-		cfg.GroupKey, cfg.StyleColor, m.targetsLabel(), cfg.Interval)
-	m.poll(ctx)
-
-	for {
-		jitter := time.Duration(rand.Int63n(int64(cfg.Interval)/5)) - cfg.Interval/10
-		select {
-		case <-ctx.Done():
-			log.Println("shutting down")
-			return
-		case <-time.After(cfg.Interval + jitter):
-			m.poll(ctx)
-		}
-	}
 }
