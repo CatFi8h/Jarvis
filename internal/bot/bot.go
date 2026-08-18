@@ -142,6 +142,10 @@ func (b *Bot) helpText() string {
 		sb.WriteString("   /" + n + "_status – current state\n")
 		sb.WriteString("   /" + n + "_check – check right now\n")
 		if n == "gr" {
+			sb.WriteString("   /gr_trains tb|bt <date> – list trains & seats (tb = Tbilisi→Batumi, bt = Batumi→Tbilisi)\n")
+			sb.WriteString("   /gr_search tb|bt <date> <HH:MM and/or train №> – watch a train (run several at once)\n")
+			sb.WriteString("   /gr_list – your active searches\n")
+			sb.WriteString("   /gr_cancel <id|all> – stop a search\n")
 			sb.WriteString("   /gr_heartbeat_off | /gr_heartbeat_on – periodic pings\n")
 		}
 		sb.WriteString("\n")

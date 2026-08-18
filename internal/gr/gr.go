@@ -1,10 +1,13 @@
-// Package gr is the Georgian Railway ticket parser: it polls gr.com.ge for a free
-// seat on a specific train (date + time and/or train number) and alerts
-// subscribed chats the moment one appears.
+// Package gr is the Georgian Railway ticket parser: it polls gr.com.ge for free
+// seats on specific trains and alerts the chat that asked the moment one appears.
 //
-// The search target is configured in .env — see .env.example. Optionally a
-// captured "Copy as cURL" request (API_CURL_FILE, default request.curl) supplies
-// auth cookies/headers; otherwise the known default endpoint is used.
+// Unlike the old single-search setup, every chat can run several concurrent
+// searches (e.g. Tbilisi→Batumi 06:00 and 08:00, plus Batumi→Tbilisi next day),
+// each created from the bot with /gr_search and persisted across restarts.
+// .env only supplies defaults (poll interval, passengers, endpoint overrides) —
+// see .env.example. Optionally a captured "Copy as cURL" request (API_CURL_FILE,
+// default request.curl) supplies auth cookies/headers; otherwise the known
+// default endpoint is used.
 package gr
 
 import (
@@ -31,17 +34,48 @@ const (
 	defaultEndpoint = "https://gr.com.ge/api/ticket-search"
 )
 
+// ─────────────────────────────── stations ──────────────────────────────────
+
+const (
+	tbilisiCode = "56014"
+	batumiCode  = "57151"
+)
+
+func stationName(code string) string {
+	switch code {
+	case tbilisiCode:
+		return "Tbilisi"
+	case batumiCode:
+		return "Batumi"
+	}
+	return code
+}
+
+// parseDirection maps a user token to (from, to) station codes.
+// "tb"/"tbilisi"/"tbilisi-batumi" → Tbilisi→Batumi; "bt"/"batumi"/... → back.
+func parseDirection(tok string) (from, to string, ok bool) {
+	t := strings.ToLower(strings.TrimSpace(tok))
+	switch {
+	case t == "":
+		return "", "", false
+	case strings.HasPrefix(t, "t"):
+		return tbilisiCode, batumiCode, true
+	case strings.HasPrefix(t, "b"):
+		return batumiCode, tbilisiCode, true
+	}
+	return "", "", false
+}
+
+func routeLabel(from, to string) string {
+	return stationName(from) + "→" + stationName(to)
+}
+
 // ─────────────────────────────── config ────────────────────────────────────
 
 type Config struct {
-	StartStation string
-	EndStation   string
-	Date         string // YYYY-MM-DD
-	DepTime      string // HH:MM (optional)
-	TrainNumber  string // e.g. 803 (optional)
-	Passengers   string
-	Child        string
-	Disabled     string
+	Passengers string
+	Child      string
+	Disabled   string
 
 	Interval      time.Duration
 	AlertRepeat   time.Duration
@@ -49,6 +83,8 @@ type Config struct {
 
 	APIEndpoint string
 	RouteType   int
+
+	SearchesFile string
 
 	CurlFile   string
 	APIURL     string
@@ -59,15 +95,11 @@ type Config struct {
 
 func loadConfig() (*Config, error) {
 	c := &Config{
-		StartStation: env("START_STATION_CODE", "57151"),
-		EndStation:   env("END_STATION_CODE", "56014"),
-		Date:         env("DEPARTURE_DATE", ""),
-		DepTime:      strings.TrimSpace(env("DEPARTURE_TIME", "")),
-		TrainNumber:  strings.TrimSpace(env("TRAIN_NUMBER", "")),
 		Passengers:   env("PASSENGERS", "1"),
 		Child:        env("CHILD_PASSENGERS", "0"),
 		Disabled:     env("DISABLED_PASSENGERS", "0"),
 		APIEndpoint:  env("API_ENDPOINT", defaultEndpoint),
+		SearchesFile: env("GR_SEARCHES_FILE", "gr_searches.json"),
 		CurlFile:     env("API_CURL_FILE", "request.curl"),
 		APIURL:       env("API_URL", ""),
 		APIMethod:    env("API_METHOD", ""),
@@ -82,33 +114,16 @@ func loadConfig() (*Config, error) {
 		_ = json.Unmarshal([]byte(v), &c.APIHeaders)
 	}
 
-	if c.Date == "" {
-		return nil, fmt.Errorf("DEPARTURE_DATE is required (YYYY-MM-DD)")
-	}
-	if c.DepTime == "" && c.TrainNumber == "" {
-		return nil, fmt.Errorf("set DEPARTURE_TIME and/or TRAIN_NUMBER so the bot knows which train")
-	}
 	if c.Interval < time.Minute {
 		c.Interval = time.Minute // be polite to the site
 	}
 	return c, nil
 }
 
-func (c *Config) bookURL() string {
+func (c *Config) bookURL(from, to, date string) string {
 	return fmt.Sprintf("https://gr.com.ge/en/search?startStationCode=%s&endStationCode=%s"+
 		"&departureDateFrom=%s&standard_passengers=%s&child_passengers=%s&disabled_passengers=%s",
-		c.StartStation, c.EndStation, c.Date, c.Passengers, c.Child, c.Disabled)
-}
-
-func (c *Config) target() string {
-	parts := []string{}
-	if c.TrainNumber != "" {
-		parts = append(parts, "N"+c.TrainNumber)
-	}
-	if c.DepTime != "" {
-		parts = append(parts, c.DepTime)
-	}
-	return strings.Join(parts, " @ ") + " on " + c.Date
+		from, to, date, c.Passengers, c.Child, c.Disabled)
 }
 
 func env(k, def string) string {
@@ -153,13 +168,15 @@ type searchBody struct {
 	RouteType          int    `json:"routeType"`
 }
 
-// buildRequest constructs the poll request. Priority: (1) captured cURL in
-// CurlFile, (2) explicit API_URL + API_BODY, (3) the known default POST.
-func buildRequest(c *Config) (*request, error) {
+// buildRequest constructs a poll request for one route+date. Priority:
+// (1) captured cURL in CurlFile, (2) explicit API_URL + API_BODY, (3) the known
+// default POST. Captured/explicit requests get their station codes and date
+// rewritten to the requested route.
+func buildRequest(c *Config, from, to, date string) (*request, error) {
 	if raw, err := os.ReadFile(c.CurlFile); err == nil {
 		if curl := stripComments(string(raw)); strings.Contains(curl, "http") {
 			r := parseCurl(curl)
-			return applyOverrides(c, r), nil
+			return applyOverrides(c, r, from, to, date), nil
 		}
 	}
 
@@ -176,13 +193,13 @@ func buildRequest(c *Config) (*request, error) {
 		for k, v := range c.APIHeaders {
 			r.headers[k] = v
 		}
-		return applyOverrides(c, r), nil
+		return applyOverrides(c, r, from, to, date), nil
 	}
 
 	body, err := json.Marshal(searchBody{
-		StartStationCode:   c.StartStation,
-		EndStationCode:     c.EndStation,
-		DepartureDateFrom:  c.Date,
+		StartStationCode:   from,
+		EndStationCode:     to,
+		DepartureDateFrom:  date,
 		StandardPassengers: atoiDefault(c.Passengers, 1),
 		ChildPassengers:    atoiDefault(c.Child, 0),
 		DisabledPassengers: atoiDefault(c.Disabled, 0),
@@ -209,15 +226,18 @@ func defaultHeaders() map[string]string {
 	}
 }
 
-// applyOverrides forces the target date and query params to match config.
-func applyOverrides(c *Config, r *request) *request {
-	r.url = dateRe.ReplaceAllString(r.url, c.Date)
-	r.body = dateRe.ReplaceAllString(r.body, c.Date)
+// applyOverrides forces the target route/date onto a captured request: dates via
+// regex, station codes via query params and JSON body fields.
+func applyOverrides(c *Config, r *request, from, to, date string) *request {
+	r.url = dateRe.ReplaceAllString(r.url, date)
+	r.body = dateRe.ReplaceAllString(r.body, date)
+	r.body = setJSONField(r.body, "startStationCode", from)
+	r.body = setJSONField(r.body, "endStationCode", to)
 	if u, err := url.Parse(r.url); err == nil {
 		q := u.Query()
-		override(q, "startStationCode", c.StartStation)
-		override(q, "endStationCode", c.EndStation)
-		override(q, "departureDateFrom", c.Date)
+		override(q, "startStationCode", from)
+		override(q, "endStationCode", to)
+		override(q, "departureDateFrom", date)
 		override(q, "standard_passengers", c.Passengers)
 		override(q, "child_passengers", c.Child)
 		override(q, "disabled_passengers", c.Disabled)
@@ -227,6 +247,15 @@ func applyOverrides(c *Config, r *request) *request {
 		}
 	}
 	return r
+}
+
+// setJSONField rewrites "key":"..." or "key":123 in a raw JSON body.
+func setJSONField(body, key, val string) string {
+	if body == "" {
+		return body
+	}
+	re := regexp.MustCompile(`"` + regexp.QuoteMeta(key) + `"\s*:\s*("[^"]*"|\d+)`)
+	return re.ReplaceAllString(body, `"`+key+`":"`+val+`"`)
 }
 
 func stripComments(s string) string {
@@ -352,10 +381,16 @@ func shellSplit(s string) []string {
 // ───────────────────── response schema (gr.com.ge) ─────────────────────────
 
 type ride struct {
-	RideNumber       int         `json:"rideNumber"`
-	StartDate        string      `json:"startDate"`
+	RideNumber int    `json:"rideNumber"`
+	StartDate  string `json:"startDate"`
+	// rideStartStation/rideEndStation are the train's full route endpoints (an
+	// international train Yerevan→Batumi shows Yerevan there, with Yerevan
+	// departure times). startStation/endStation are the SEARCHED segment
+	// (e.g. Tbilisi→Batumi) — always prefer those for matching and display.
 	RideStartStation rideStation `json:"rideStartStation"`
 	RideEndStation   rideStation `json:"rideEndStation"`
+	StartStation     rideStation `json:"startStation"`
+	EndStation       rideStation `json:"endStation"`
 	SeatClasses      []seatAvail `json:"availableSeatsClasses"`
 }
 
@@ -367,6 +402,20 @@ type rideStation struct {
 	DepartureTime       string `json:"departureTime"` // "08:00:00" (local)
 	DepartureTimeHour   int    `json:"departureTimeHour"`
 	DepartureTimeMinute int    `json:"departureTimeMinute"`
+	ArrivalTime         string `json:"arrivalTime"` // "07:07:00" (local)
+}
+
+// seg returns the searched-segment stations, falling back to the ride's own
+// endpoints when the segment fields are absent (older response shape).
+func (r *ride) seg() (dep, arr *rideStation) {
+	dep, arr = &r.StartStation, &r.EndStation
+	if dep.Station.Code == "" {
+		dep = &r.RideStartStation
+	}
+	if arr.Station.Code == "" {
+		arr = &r.RideEndStation
+	}
+	return dep, arr
 }
 
 type seatAvail struct {
@@ -382,7 +431,14 @@ type seatAvail struct {
 }
 
 func (r *ride) hhmm() string {
-	return fmt.Sprintf("%02d:%02d", r.RideStartStation.DepartureTimeHour, r.RideStartStation.DepartureTimeMinute)
+	dep, _ := r.seg()
+	return fmt.Sprintf("%02d:%02d", dep.DepartureTimeHour, dep.DepartureTimeMinute)
+}
+
+// arrHHMM is the searched-segment arrival time ("" if unknown).
+func (r *ride) arrHHMM() string {
+	_, arr := r.seg()
+	return normHHMM(arr.ArrivalTime)
 }
 
 // parseRides handles both [[...]] and [...] shapes.
@@ -417,22 +473,23 @@ func normHHMM(s string) string {
 	return fmt.Sprintf("%02d:%02d", h, m)
 }
 
-// findRide returns the ride matching train number and/or departure time.
-func findRide(rides []ride, c *Config) (*ride, bool) {
+// findRide returns the ride matching a search's train number and/or time.
+func findRide(rides []ride, s *Search) (*ride, bool) {
 	wantNum, hasNum := 0, false
-	if c.TrainNumber != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(c.TrainNumber)); err == nil {
+	if s.TrainNum != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(s.TrainNum)); err == nil {
 			wantNum, hasNum = n, true
 		}
 	}
-	wantTime := normHHMM(c.DepTime)
+	wantTime := normHHMM(s.DepTime)
 	hasTime := wantTime != ""
 
 	for i := range rides {
 		r := &rides[i]
+		dep, _ := r.seg()
 		numOK := !hasNum || r.RideNumber == wantNum
 		timeOK := !hasTime || r.hhmm() == wantTime ||
-			strings.HasPrefix(r.RideStartStation.DepartureTime, wantTime)
+			strings.HasPrefix(dep.DepartureTime, wantTime)
 		if numOK && timeOK {
 			return r, true
 		}
@@ -464,22 +521,22 @@ func summarizeRides(rides []ride) string {
 	return strings.Join(parts, ", ")
 }
 
-// diagnose explains why findRide returned nothing.
-func diagnose(rides []ride, c *Config) string {
-	if c.TrainNumber != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(c.TrainNumber)); err == nil {
+// diagnose explains why findRide returned nothing for a search.
+func diagnose(rides []ride, s *Search) string {
+	if s.TrainNum != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(s.TrainNum)); err == nil {
 			for i := range rides {
 				if rides[i].RideNumber == n {
 					got := rides[i].hhmm()
-					if c.DepTime != "" && normHHMM(c.DepTime) != got {
-						return fmt.Sprintf("N%d is in the results but departs %s, not your DEPARTURE_TIME=%s. "+
-							"Set DEPARTURE_TIME=%s in .env (or clear it to match by number only).",
-							n, got, c.DepTime, got)
+					if s.DepTime != "" && normHHMM(s.DepTime) != got {
+						return fmt.Sprintf("N%d is in the results but departs %s, not %s. "+
+							"Cancel this search and re-add it with time %s (or with the train number only).",
+							n, got, s.DepTime, got)
 					}
 					return fmt.Sprintf("N%d found at %s.", n, got)
 				}
 			}
-			return fmt.Sprintf("N%d is not in the results for %s. Trains found: %s", n, c.Date, summarizeRides(rides))
+			return fmt.Sprintf("N%d is not in the results for %s. Trains found: %s", n, s.Date, summarizeRides(rides))
 		}
 	}
 	return "No train matched. Trains found: " + summarizeRides(rides)
@@ -518,19 +575,57 @@ func fetch(client *http.Client, r *request) ([]byte, error) {
 	return body, nil
 }
 
-// ──────────────────────────── watcher / state ──────────────────────────────
+// ──────────────────────────────── watcher ──────────────────────────────────
 
-type state struct {
-	mu         sync.Mutex
-	checks     int
-	lastCheck  time.Time
-	lastResult string
-	available  bool
-	lastAlert  time.Time
+const maxSearchesPerChat = 10
+
+// Watcher is the GR parser. It implements parser.Parser.
+type Watcher struct {
+	cfg    *Config
+	client *http.Client
+	reg    *subs.Registry
+	tg     *tg.Telegram
+	store  *store
+
+	mu        sync.Mutex // guards checks/lastCheck and serializes checkAll
+	checks    int
+	lastCheck time.Time
 }
 
-// checkResult carries one poll's outcome for broadcasting and /check replies.
-type checkResult struct {
+// New builds the GR watcher, loading defaults from the environment and active
+// searches from the searches file.
+func New(reg *subs.Registry, t *tg.Telegram) (*Watcher, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, err
+	}
+	return &Watcher{
+		cfg:    cfg,
+		client: &http.Client{Timeout: 30 * time.Second},
+		reg:    reg,
+		tg:     t,
+		store:  newStore(cfg.SearchesFile),
+	}, nil
+}
+
+func (w *Watcher) Name() string { return name }
+
+// fetchRides performs one API call for a route+date and parses the trains.
+func (w *Watcher) fetchRides(from, to, date string) ([]ride, error) {
+	req, err := buildRequest(w.cfg, from, to, date)
+	if err != nil {
+		return nil, err
+	}
+	body, err := fetch(w.client, req)
+	if err != nil {
+		return nil, err
+	}
+	return parseRides(body)
+}
+
+// searchResult carries one search's poll outcome.
+type searchResult struct {
+	search    Search
 	err       error
 	notFound  bool
 	diag      string
@@ -540,101 +635,22 @@ type checkResult struct {
 	available bool
 }
 
-// Watcher is the GR parser. It implements parser.Parser.
-type Watcher struct {
-	cfg    *Config
-	req    *request
-	client *http.Client
-	reg    *subs.Registry
-	tg     *tg.Telegram
-	state  *state
-
-	pollMu         sync.Mutex // serializes poll(), guards firstRun/warnedNotFound
-	firstRun       bool
-	warnedNotFound bool
-}
-
-// New builds the GR watcher, loading config and the poll request from the
-// environment. Returns an error if required config is missing.
-func New(reg *subs.Registry, t *tg.Telegram) (*Watcher, error) {
-	cfg, err := loadConfig()
-	if err != nil {
-		return nil, err
-	}
-	req, err := buildRequest(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &Watcher{
-		cfg:      cfg,
-		req:      req,
-		client:   &http.Client{Timeout: 30 * time.Second},
-		reg:      reg,
-		tg:       t,
-		state:    &state{},
-		firstRun: true,
-	}, nil
-}
-
-func (w *Watcher) Name() string { return name }
-
-// poll performs one fetch+parse+match, updates state, and returns the result.
-func (w *Watcher) poll() checkResult {
-	w.pollMu.Lock()
-	defer w.pollMu.Unlock()
-
-	var res checkResult
-	body, err := fetch(w.client, w.req)
-	w.state.mu.Lock()
-	w.state.checks++
-	w.state.lastCheck = time.Now()
-	w.state.mu.Unlock()
-
-	ts := time.Now().Format("15:04:05")
-	if err != nil {
-		res.err = err
-		log.Printf("[gr] [%s] fetch error: %v", ts, err)
-		w.state.mu.Lock()
-		w.state.lastResult = "fetch error: " + err.Error()
-		w.state.mu.Unlock()
+// evaluate matches one search against fetched rides (or a fetch error) and
+// updates the search's runtime state.
+func (w *Watcher) evaluate(s Search, rides []ride, fetchErr error) searchResult {
+	res := searchResult{search: s}
+	if fetchErr != nil {
+		res.err = fetchErr
+		w.store.Update(s.ID, false, func(x *Search) { x.LastResult = "fetch error: " + fetchErr.Error() })
 		return res
 	}
-
-	rides, perr := parseRides(body)
-	if perr != nil {
-		res.err = perr
-		log.Printf("[gr] [%s] parse error: %v", ts, perr)
-		if w.firstRun {
-			snippet := string(body)
-			if len(snippet) > 500 {
-				snippet = snippet[:500]
-			}
-			log.Println("[gr] raw response head:", snippet)
-		}
-		w.state.mu.Lock()
-		w.state.lastResult = "parse error: " + perr.Error()
-		w.state.mu.Unlock()
-		w.firstRun = false
-		return res
-	}
-
-	if w.firstRun {
-		log.Printf("[gr] first check — trains returned: %s", summarizeRides(rides))
-	}
-	w.firstRun = false
-
-	r, ok := findRide(rides, w.cfg)
+	r, ok := findRide(rides, &s)
 	if !ok {
 		res.notFound = true
-		res.diag = diagnose(rides, w.cfg)
-		log.Printf("[gr] [%s] %s", ts, res.diag)
-		w.state.mu.Lock()
-		w.state.lastResult = res.diag
-		w.state.available = false
-		w.state.mu.Unlock()
+		res.diag = diagnose(rides, &s)
+		w.store.Update(s.ID, false, func(x *Search) { x.LastResult = res.diag; x.Available = false })
 		return res
 	}
-
 	total, lines := seatInfo(r)
 	res.ride, res.total = r, total
 	res.breakdown = strings.Join(lines, ", ")
@@ -642,79 +658,157 @@ func (w *Watcher) poll() checkResult {
 		res.breakdown = "no classes on sale"
 	}
 	res.available = total > 0
-
-	w.state.mu.Lock()
-	w.state.available = res.available
-	if res.available {
-		w.state.lastResult = fmt.Sprintf("AVAILABLE — %d seats (%s)", total, res.breakdown)
-	} else {
-		w.state.lastResult = "no seats (sold out)"
-	}
-	w.state.mu.Unlock()
-
-	if res.available {
-		log.Printf("[gr] [%s] N%d @ %s — SEATS AVAILABLE: %d (%s)", ts, r.RideNumber, r.hhmm(), total, res.breakdown)
-	} else {
-		log.Printf("[gr] [%s] N%d @ %s — no seats (sold out)", ts, r.RideNumber, r.hhmm())
-	}
+	w.store.Update(s.ID, false, func(x *Search) {
+		x.Available = res.available
+		if res.available {
+			x.LastResult = fmt.Sprintf("AVAILABLE — %d seats (%s)", total, res.breakdown)
+		} else {
+			x.LastResult = "no seats (sold out)"
+		}
+	})
 	return res
 }
 
-func (w *Watcher) alertText(res checkResult) string {
-	r := res.ride
-	return fmt.Sprintf("✅ Seats available — N%d %s→%s at %s on %s\n\n%s\nTotal: %d\n\nBook now: %s",
-		r.RideNumber, r.RideStartStation.Station.Name, r.RideEndStation.Station.Name,
-		r.hhmm(), w.cfg.Date, res.breakdown, res.total, w.cfg.bookURL())
+// checkAll expires old searches, fetches each unique route+date once, evaluates
+// every search and (if alert=true) notifies owner chats about free seats.
+func (w *Watcher) checkAll(alert bool) []searchResult {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	today := time.Now().Format("2006-01-02")
+	for _, s := range w.store.ExpireBefore(today) {
+		w.tg.SendTo(s.ChatID, fmt.Sprintf("🗓 Search #%d (%s %s %s) expired — its date has passed.",
+			s.ID, routeLabel(s.FromCode, s.ToCode), s.Date, s.targetShort()))
+	}
+
+	searches := w.store.Snapshot()
+	if len(searches) == 0 {
+		return nil
+	}
+
+	w.checks++
+	w.lastCheck = time.Now()
+
+	// One fetch per unique route+date.
+	type fetched struct {
+		rides []ride
+		err   error
+	}
+	cache := map[routeKey]fetched{}
+	ts := time.Now().Format("15:04:05")
+	var results []searchResult
+	for i := range searches {
+		s := searches[i]
+		key := s.routeKey()
+		f, ok := cache[key]
+		if !ok {
+			rides, err := w.fetchRides(key.From, key.To, key.Date)
+			f = fetched{rides: rides, err: err}
+			cache[key] = f
+			if err != nil {
+				log.Printf("[gr] [%s] %s %s: fetch error: %v", ts, routeLabel(key.From, key.To), key.Date, err)
+			}
+		}
+		res := w.evaluate(s, f.rides, f.err)
+		results = append(results, res)
+		w.logResult(ts, res)
+		if alert {
+			w.maybeAlert(res)
+		}
+	}
+	return results
 }
 
-// statusFor formats a poll result as a reply to a /gr_check request.
-func (w *Watcher) statusFor(res checkResult) string {
+func (w *Watcher) logResult(ts string, res searchResult) {
+	s := res.search
 	switch {
 	case res.err != nil:
-		return "⚠️ check failed: " + res.err.Error()
+		// fetch errors logged once per route in checkAll
 	case res.notFound:
-		return "⚠️ " + res.diag
+		log.Printf("[gr] [%s] #%d %s", ts, s.ID, res.diag)
 	case res.available:
-		return w.alertText(res)
+		log.Printf("[gr] [%s] #%d N%d @ %s — SEATS AVAILABLE: %d (%s)", ts, s.ID, res.ride.RideNumber, res.ride.hhmm(), res.total, res.breakdown)
 	default:
-		return fmt.Sprintf("N%d @ %s on %s — no seats yet (sold out).",
-			res.ride.RideNumber, res.ride.hhmm(), w.cfg.Date)
+		log.Printf("[gr] [%s] #%d N%d @ %s — no seats (sold out)", ts, s.ID, res.ride.RideNumber, res.ride.hhmm())
 	}
 }
 
-// doCheck runs a poll and broadcasts alerts to subscribers (throttled).
-// Only called from the Run loop (single goroutine), so warnedNotFound is safe.
-func (w *Watcher) doCheck() {
-	res := w.poll()
+// maybeAlert notifies the search's chat: free seats (throttled by AlertRepeat)
+// or a one-time "train not found" warning. Respects the chat's mute setting.
+func (w *Watcher) maybeAlert(res searchResult) {
+	s := res.search
+	p := w.reg.Get(s.ChatID, name)
+	if !p.Subscribed || p.Muted {
+		return
+	}
 	switch {
 	case res.err != nil:
-		// logged in poll
+		// transient; don't spam
 	case res.notFound:
-		if !w.warnedNotFound {
-			w.warnedNotFound = true
-			w.tg.Broadcast(w.reg.Targets(name, true), "⚠️ "+res.diag)
+		if !s.Warned {
+			w.store.Update(s.ID, true, func(x *Search) { x.Warned = true })
+			w.tg.SendTo(s.ChatID, fmt.Sprintf("⚠️ Search #%d: %s", s.ID, res.diag))
+		}
+	case res.available:
+		if s.Warned {
+			w.store.Update(s.ID, true, func(x *Search) { x.Warned = false })
+		}
+		if time.Since(s.LastAlert) > w.cfg.AlertRepeat {
+			w.store.Update(s.ID, true, func(x *Search) { x.LastAlert = time.Now() })
+			w.tg.SendTo(s.ChatID, w.alertText(res))
 		}
 	default:
-		w.warnedNotFound = false
-		if res.available {
-			w.state.mu.Lock()
-			should := time.Since(w.state.lastAlert) > w.cfg.AlertRepeat
-			if should {
-				w.state.lastAlert = time.Now()
-			}
-			w.state.mu.Unlock()
-			if should {
-				w.tg.Broadcast(w.reg.Targets(name, true), w.alertText(res))
-			}
+		if s.Warned {
+			w.store.Update(s.ID, true, func(x *Search) { x.Warned = false })
 		}
 	}
+}
+
+func (w *Watcher) alertText(res searchResult) string {
+	r := res.ride
+	s := res.search
+	dep, arr := r.seg()
+	return fmt.Sprintf("✅ Search #%d — seats available!\nN%d %s→%s at %s on %s\n\n%s\nTotal: %d\n\nBook now: %s",
+		s.ID, r.RideNumber, dep.Station.Name, arr.Station.Name,
+		r.hhmm(), s.Date, res.breakdown, res.total, w.cfg.bookURL(s.FromCode, s.ToCode, s.Date))
+}
+
+// statusFor formats one search's poll result as a reply line.
+func (w *Watcher) statusFor(res searchResult) string {
+	s := res.search
+	head := fmt.Sprintf("#%d %s %s %s", s.ID, routeLabel(s.FromCode, s.ToCode), s.Date, s.targetShort())
+	switch {
+	case res.err != nil:
+		return head + " — ⚠️ check failed: " + res.err.Error()
+	case res.notFound:
+		return head + " — ⚠️ " + res.diag
+	case res.available:
+		return head + fmt.Sprintf(" — ✅ %d seats (%s)\nBook: %s",
+			res.total, res.breakdown, w.cfg.bookURL(s.FromCode, s.ToCode, s.Date))
+	default:
+		return head + " — no seats yet (sold out)"
+	}
+}
+
+// targetShort describes what the search matches on, e.g. "N803 @ 08:00".
+func (s *Search) targetShort() string {
+	var parts []string
+	if s.TrainNum != "" {
+		parts = append(parts, "N"+s.TrainNum)
+	}
+	if s.DepTime != "" {
+		parts = append(parts, "@ "+s.DepTime)
+	}
+	if len(parts) == 0 {
+		return "any train"
+	}
+	return strings.Join(parts, " ")
 }
 
 // Run is the independent poll loop plus optional heartbeat.
 func (w *Watcher) Run(ctx context.Context) {
-	base, _, _ := strings.Cut(w.req.url, "?")
-	log.Printf("[gr] watching %s | endpoint %s %s | every %s",
-		w.cfg.target(), w.req.method, base, w.cfg.Interval)
+	log.Printf("[gr] multi-search watcher | %d active searches | every %s",
+		len(w.store.Snapshot()), w.cfg.Interval)
 
 	if w.cfg.HeartbeatEver > 0 {
 		go func() {
@@ -725,17 +819,13 @@ func (w *Watcher) Run(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					w.state.mu.Lock()
-					n, res := w.state.checks, w.state.lastResult
-					w.state.mu.Unlock()
-					w.tg.Broadcast(w.reg.Targets(name, false),
-						fmt.Sprintf("⏱ Still watching %s — %d checks, latest: %s", w.cfg.target(), n, res))
+					w.heartbeat()
 				}
 			}
 		}()
 	}
 
-	w.doCheck()
+	w.checkAll(true)
 	ticker := time.NewTicker(w.cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -745,9 +835,87 @@ func (w *Watcher) Run(ctx context.Context) {
 			w.tg.Broadcast(w.reg.Targets(name, true), "👋 GR watcher stopped.")
 			return
 		case <-ticker.C:
-			w.doCheck()
+			w.checkAll(true)
 		}
 	}
+}
+
+// heartbeat sends each subscribed chat a summary of its own searches.
+func (w *Watcher) heartbeat() {
+	w.mu.Lock()
+	n, last := w.checks, w.lastCheck
+	w.mu.Unlock()
+	for _, chatID := range w.reg.Targets(name, false) {
+		list := w.store.ForChat(chatID)
+		if len(list) == 0 {
+			continue
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "⏱ Still watching %d search(es) — %d checks, last at %s:\n",
+			len(list), n, last.Format("15:04:05"))
+		for i := range list {
+			s := &list[i]
+			res := s.LastResult
+			if res == "" {
+				res = "—"
+			}
+			fmt.Fprintf(&sb, "#%d %s %s %s: %s\n", s.ID, routeLabel(s.FromCode, s.ToCode), s.Date, s.targetShort(), res)
+		}
+		w.tg.SendTo(chatID, strings.TrimSpace(sb.String()))
+	}
+}
+
+// ────────────────────────────── commands ───────────────────────────────────
+
+const usage = "Usage:\n" +
+	"/gr_trains <tb|bt> <date> — list trains & seats (tb = Tbilisi→Batumi, bt = Batumi→Tbilisi; date = YYYY-MM-DD, today, tomorrow)\n" +
+	"/gr_search <tb|bt> <date> <HH:MM and/or train number> — start watching a train, e.g.\n" +
+	"   /gr_search tb 2026-08-20 06:00\n" +
+	"   /gr_search bt tomorrow 803\n" +
+	"/gr_list — your active searches\n" +
+	"/gr_cancel <id|all> — stop a search\n" +
+	"/gr_check [id] — check now"
+
+// parseDate accepts YYYY-MM-DD, "today", "tomorrow"; rejects past dates.
+func parseDate(tok string) (string, error) {
+	t := strings.ToLower(strings.TrimSpace(tok))
+	now := time.Now()
+	switch t {
+	case "today":
+		return now.Format("2006-01-02"), nil
+	case "tomorrow":
+		return now.AddDate(0, 0, 1).Format("2006-01-02"), nil
+	}
+	d, err := time.Parse("2006-01-02", t)
+	if err != nil {
+		return "", fmt.Errorf("bad date %q — use YYYY-MM-DD, today or tomorrow", tok)
+	}
+	if d.Format("2006-01-02") < now.Format("2006-01-02") {
+		return "", fmt.Errorf("date %s is in the past", tok)
+	}
+	return d.Format("2006-01-02"), nil
+}
+
+var timeTokRe = regexp.MustCompile(`^\d{1,2}:\d{2}$`)
+var numTokRe = regexp.MustCompile(`^n?\d{1,5}$`)
+
+// parseTarget classifies trailing tokens into departure time and train number.
+func parseTarget(toks []string) (depTime, trainNum string, err error) {
+	for _, t := range toks {
+		lt := strings.ToLower(strings.TrimSpace(t))
+		switch {
+		case timeTokRe.MatchString(lt):
+			depTime = normHHMM(lt)
+		case numTokRe.MatchString(lt):
+			trainNum = strings.TrimPrefix(lt, "n")
+		default:
+			return "", "", fmt.Errorf("can't understand %q — expected HH:MM or a train number", t)
+		}
+	}
+	if depTime == "" && trainNum == "" {
+		return "", "", fmt.Errorf("give a departure time (HH:MM) and/or a train number")
+	}
+	return depTime, trainNum, nil
 }
 
 // Handle processes /gr_<action> commands for one chat.
@@ -755,11 +923,10 @@ func (w *Watcher) Handle(chatID, action, args string) string {
 	switch action {
 	case "start":
 		w.reg.Subscribe(chatID, name)
-		return fmt.Sprintf("🚆 Subscribed to GR. Watching %s every %s. I'll ping you when a seat opens.",
-			w.cfg.target(), w.cfg.Interval)
+		return "🚆 Subscribed to GR (Georgian Railway) alerts.\n\n" + usage
 	case "stop":
 		w.reg.Mute(chatID, name, true)
-		return "🔕 GR seat alerts paused for this chat. Send /gr_continue to resume."
+		return "🔕 GR seat alerts paused for this chat (searches keep running). /gr_continue to resume."
 	case "continue":
 		w.reg.Mute(chatID, name, false)
 		return "🔔 GR seat alerts resumed."
@@ -769,31 +936,216 @@ func (w *Watcher) Handle(chatID, action, args string) string {
 	case "heartbeat_on":
 		w.reg.SetHeartbeat(chatID, name, false)
 		return "⏱ GR heartbeat on for this chat."
+	case "trains":
+		return w.handleTrains(args)
+	case "search", "add":
+		return w.handleSearch(chatID, args)
+	case "list":
+		return w.handleList(chatID)
+	case "cancel", "del", "delete":
+		return w.handleCancel(chatID, args)
+	case "check":
+		return w.handleCheck(chatID, args)
 	case "status":
 		return w.StatusLine(chatID)
-	case "check":
-		return "Checking GR now…\n" + w.statusFor(w.poll())
 	default:
 		return ""
 	}
 }
 
+// handleTrains lists the trains the API returns for a direction+date.
+func (w *Watcher) handleTrains(args string) string {
+	toks := strings.Fields(args)
+	if len(toks) < 2 {
+		return "⚠️ " + usage
+	}
+	from, to, ok := parseDirection(toks[0])
+	if !ok {
+		return "⚠️ Bad direction — use tb (Tbilisi→Batumi) or bt (Batumi→Tbilisi)."
+	}
+	date, err := parseDate(toks[1])
+	if err != nil {
+		return "⚠️ " + err.Error()
+	}
+	rides, err := w.fetchRides(from, to, date)
+	if err != nil {
+		return "⚠️ fetch failed: " + err.Error()
+	}
+	if len(rides) == 0 {
+		return fmt.Sprintf("No trains returned for %s on %s.", routeLabel(from, to), date)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "🚆 %s on %s:\n", routeLabel(from, to), date)
+	for i := range rides {
+		r := &rides[i]
+		total, lines := seatInfo(r)
+		seats := "sold out"
+		if total > 0 {
+			seats = fmt.Sprintf("%d seats (%s)", total, strings.Join(lines, ", "))
+		}
+		arrive := ""
+		if a := r.arrHHMM(); a != "" {
+			arrive = " → " + a
+		}
+		fmt.Fprintf(&sb, "N%d @ %s%s — %s\n", r.RideNumber, r.hhmm(), arrive, seats)
+	}
+	sb.WriteString("\nStart watching one: /gr_search " + dirToken(from) + " " + date + " <HH:MM or train number>")
+	return sb.String()
+}
+
+func dirToken(from string) string {
+	if from == tbilisiCode {
+		return "tb"
+	}
+	return "bt"
+}
+
+// handleSearch creates a new search for this chat and checks it immediately.
+func (w *Watcher) handleSearch(chatID, args string) string {
+	toks := strings.Fields(args)
+	if len(toks) < 3 {
+		return "⚠️ " + usage
+	}
+	from, to, ok := parseDirection(toks[0])
+	if !ok {
+		return "⚠️ Bad direction — use tb (Tbilisi→Batumi) or bt (Batumi→Tbilisi)."
+	}
+	date, err := parseDate(toks[1])
+	if err != nil {
+		return "⚠️ " + err.Error()
+	}
+	depTime, trainNum, err := parseTarget(toks[2:])
+	if err != nil {
+		return "⚠️ " + err.Error()
+	}
+
+	// Refuse duplicates of an identical live search for this chat.
+	for _, ex := range w.store.ForChat(chatID) {
+		if ex.FromCode == from && ex.Date == date && ex.DepTime == depTime && ex.TrainNum == trainNum {
+			return fmt.Sprintf("You already watch this train — search #%d.", ex.ID)
+		}
+	}
+	if w.store.CountForChat(chatID) >= maxSearchesPerChat {
+		return fmt.Sprintf("⚠️ Limit of %d active searches per chat reached. /gr_cancel one first.", maxSearchesPerChat)
+	}
+
+	w.reg.Subscribe(chatID, name)
+	s := w.store.Add(Search{
+		ChatID:   chatID,
+		FromCode: from,
+		ToCode:   to,
+		Date:     date,
+		DepTime:  depTime,
+		TrainNum: trainNum,
+	})
+
+	// Immediate first check so the user sees the current state.
+	rides, ferr := w.fetchRides(from, to, date)
+	res := w.evaluate(s, rides, ferr)
+	return fmt.Sprintf("🔍 Search #%d started: %s %s %s, checking every %s.\n\nRight now: %s",
+		s.ID, routeLabel(from, to), date, s.targetShort(), w.cfg.Interval, w.statusFor(res))
+}
+
+func (w *Watcher) handleList(chatID string) string {
+	list := w.store.ForChat(chatID)
+	if len(list) == 0 {
+		return "No active searches. Start one:\n\n" + usage
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Your active searches (%d):\n", len(list))
+	for i := range list {
+		s := &list[i]
+		res := s.LastResult
+		if res == "" {
+			res = "not checked yet"
+		}
+		fmt.Fprintf(&sb, "#%d %s %s %s — %s\n", s.ID, routeLabel(s.FromCode, s.ToCode), s.Date, s.targetShort(), res)
+	}
+	sb.WriteString("\n/gr_cancel <id> to stop one, /gr_check <id> to check now")
+	return sb.String()
+}
+
+func (w *Watcher) handleCancel(chatID, args string) string {
+	arg := strings.ToLower(strings.TrimSpace(args))
+	if arg == "" {
+		return "⚠️ Usage: /gr_cancel <id|all> — see ids in /gr_list"
+	}
+	if arg == "all" {
+		n := w.store.RemoveAll(chatID)
+		if n == 0 {
+			return "No active searches to cancel."
+		}
+		return fmt.Sprintf("🗑 Cancelled %d search(es).", n)
+	}
+	id, err := strconv.Atoi(strings.TrimPrefix(arg, "#"))
+	if err != nil {
+		return "⚠️ Bad id — use a number from /gr_list, or 'all'."
+	}
+	s, ok := w.store.Remove(chatID, id)
+	if !ok {
+		return fmt.Sprintf("Search #%d not found among your searches. /gr_list to see them.", id)
+	}
+	return fmt.Sprintf("🗑 Search #%d (%s %s %s) cancelled.", s.ID, routeLabel(s.FromCode, s.ToCode), s.Date, s.targetShort())
+}
+
+// handleCheck polls now: one search by id, or all of this chat's searches.
+func (w *Watcher) handleCheck(chatID, args string) string {
+	arg := strings.TrimSpace(args)
+	if arg != "" {
+		id, err := strconv.Atoi(strings.TrimPrefix(arg, "#"))
+		if err != nil {
+			return "⚠️ Bad id — use a number from /gr_list."
+		}
+		for _, s := range w.store.ForChat(chatID) {
+			if s.ID == id {
+				rides, ferr := w.fetchRides(s.FromCode, s.ToCode, s.Date)
+				return "Checked now:\n" + w.statusFor(w.evaluate(s, rides, ferr))
+			}
+		}
+		return fmt.Sprintf("Search #%d not found among your searches.", id)
+	}
+
+	list := w.store.ForChat(chatID)
+	if len(list) == 0 {
+		return "No active searches to check. Start one:\n\n" + usage
+	}
+	results := w.checkAll(false)
+	var sb strings.Builder
+	sb.WriteString("Checked now:\n")
+	for _, res := range results {
+		if res.search.ChatID != chatID {
+			continue
+		}
+		sb.WriteString(w.statusFor(res) + "\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
 // StatusLine reports the GR parser state for a chat.
 func (w *Watcher) StatusLine(chatID string) string {
-	w.state.mu.Lock()
-	n, last, res, avail := w.state.checks, w.state.lastCheck, w.state.lastResult, w.state.available
-	w.state.mu.Unlock()
+	w.mu.Lock()
+	n, last := w.checks, w.lastCheck
+	w.mu.Unlock()
 	when := "never"
 	if !last.IsZero() {
 		when = last.Format("15:04:05") + fmt.Sprintf(" (%s ago)", time.Since(last).Round(time.Second))
 	}
-	if res == "" {
-		res = "—"
-	}
 	p := w.reg.Get(chatID, name)
-	return fmt.Sprintf("🚆 GR — %s\nChecks: %d\nLast: %s\nResult: %s\nAvailable now: %v\nYour subscription: %s | alerts: %s | heartbeat: %s",
-		w.cfg.target(), n, when, res, avail,
+	list := w.store.ForChat(chatID)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "🚆 GR — %d active search(es), poll every %s\nChecks: %d\nLast: %s\n",
+		len(list), w.cfg.Interval, n, when)
+	for i := range list {
+		s := &list[i]
+		res := s.LastResult
+		if res == "" {
+			res = "not checked yet"
+		}
+		fmt.Fprintf(&sb, "#%d %s %s %s — %s\n", s.ID, routeLabel(s.FromCode, s.ToCode), s.Date, s.targetShort(), res)
+	}
+	fmt.Fprintf(&sb, "Your subscription: %s | alerts: %s | heartbeat: %s",
 		onoff(p.Subscribed), onoff(p.Subscribed && !p.Muted), onoff(p.Subscribed && !p.HeartbeatOff))
+	return sb.String()
 }
 
 func onoff(on bool) string {
