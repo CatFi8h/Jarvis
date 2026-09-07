@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>GR Train Watch</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app">
+    <!-- Screen: home -->
+    <section id="screen-home" class="screen">
+      <h1>🚆 Train Watch</h1>
+      <p class="hint">Pick a direction to see trains and start watching for free seats.</p>
+      <div class="dir-buttons" id="dir-buttons"></div>
+
+      <div class="section-head">
+        <h2>My watches</h2>
+        <button class="link-btn" id="refresh-watches">↻ refresh</button>
+      </div>
+      <div id="watch-list" class="watch-list">
+        <p class="hint" id="watch-empty">No active watches yet.</p>
+      </div>
+    </section>
+
+    <!-- Screen: date -->
+    <section id="screen-date" class="screen hidden">
+      <h1 id="date-title">Pick a date</h1>
+      <div class="date-grid" id="date-grid"></div>
+    </section>
+
+    <!-- Screen: trains -->
+    <section id="screen-trains" class="screen hidden">
+      <h1 id="trains-title">Trains</h1>
+      <p class="hint" id="trains-sub"></p>
+      <div id="train-list" class="train-list">
+        <p class="hint" id="trains-loading">Loading trains…</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>

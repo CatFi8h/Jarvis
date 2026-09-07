@@ -19,6 +19,7 @@ import (
 	"jarvis-bot/internal/parser"
 	"jarvis-bot/internal/subs"
 	"jarvis-bot/internal/tg"
+	"jarvis-bot/internal/webapp"
 )
 
 // Bot wires the Telegram client, subscriber registry and configured parsers, and
@@ -28,6 +29,9 @@ type Bot struct {
 	reg     *subs.Registry
 	parsers map[string]parser.Parser
 	help    string // precomputed help/usage text
+
+	web    *webapp.Server // Mini App backend; nil when WEBAPP_URL is unset
+	webURL string         // public HTTPS URL of the Mini App
 }
 
 // New is the composition root: it reads config from the environment, builds the
@@ -53,10 +57,12 @@ func New() (*Bot, error) {
 	} else {
 		parsers[p.Name()] = p
 	}
+	var grw *gr.Watcher
 	if p, err := gr.New(reg, tgc); err != nil {
 		log.Printf("gr parser disabled: %v", err)
 	} else {
 		parsers[p.Name()] = p
+		grw = p
 	}
 	if len(parsers) == 0 {
 		return nil, fmt.Errorf("no parsers configured — set at least one parser's env vars (see .env.example)")
@@ -70,6 +76,19 @@ func New() (*Bot, error) {
 	}
 
 	b := &Bot{tg: tgc, reg: reg, parsers: parsers}
+
+	// Optional Telegram Mini App: needs a public HTTPS URL (WEBAPP_URL) that
+	// fronts the local listener (WEBAPP_ADDR) — e.g. a reverse proxy or a
+	// cloudflared/ngrok tunnel during development.
+	if webURL := os.Getenv("WEBAPP_URL"); webURL != "" {
+		if grw == nil {
+			log.Printf("webapp disabled: WEBAPP_URL is set but the gr parser is not configured")
+		} else {
+			b.webURL = webURL
+			b.web = webapp.New(envOr("WEBAPP_ADDR", ":8090"), token, grw)
+		}
+	}
+
 	b.help = b.helpText()
 	return b, nil
 }
@@ -79,6 +98,12 @@ func New() (*Bot, error) {
 func (b *Bot) Run(ctx context.Context) {
 	for _, p := range b.parsers {
 		go b.runSafe(ctx, p)
+	}
+	if b.web != nil {
+		go b.web.Run(ctx)
+		if err := b.tg.SetMenuButton("🚆 Trains", b.webURL); err != nil {
+			log.Printf("menu button: %v", err)
+		}
 	}
 	log.Printf("started with parsers: %s", strings.Join(b.sortedNames(), ", "))
 	b.tg.Listen(ctx, b.dispatch)
@@ -102,6 +127,14 @@ func (b *Bot) dispatch(chatID, cmd, args string) {
 	switch cmd {
 	case "start", "help":
 		b.tg.SendTo(chatID, b.help)
+		b.sendAppButton(chatID)
+		return
+	case "app", "trains":
+		if b.web != nil {
+			b.sendAppButton(chatID)
+		} else {
+			b.tg.SendTo(chatID, "Mini App is not configured (WEBAPP_URL unset).")
+		}
 		return
 	case "status":
 		b.tg.SendTo(chatID, b.statusAll(chatID))
@@ -119,6 +152,16 @@ func (b *Bot) dispatch(chatID, cmd, args string) {
 	b.tg.SendTo(chatID, "Unknown command.\n\n"+b.help)
 }
 
+// sendAppButton offers the Mini App as an inline button (no-op if disabled).
+func (b *Bot) sendAppButton(chatID string) {
+	if b.web == nil {
+		return
+	}
+	b.tg.SendWebAppButton(chatID,
+		"🚆 Tap below to pick a direction, date and train with buttons — no typing needed:",
+		"Open Train Watch", b.webURL)
+}
+
 // statusAll concatenates every parser's status line for the requesting chat.
 func (b *Bot) statusAll(chatID string) string {
 	var sb strings.Builder
@@ -134,6 +177,9 @@ func (b *Bot) statusAll(chatID string) string {
 func (b *Bot) helpText() string {
 	var sb strings.Builder
 	sb.WriteString("👋 Jarvis bot. Available parsers — subscribe to whichever you want:\n\n")
+	if b.web != nil {
+		sb.WriteString("🚆 Easiest way to watch trains: /app — opens the Train Watch Mini App (all buttons, no typing).\n\n")
+	}
 	for _, n := range b.sortedNames() {
 		sb.WriteString("• " + n + ":\n")
 		sb.WriteString("   /" + n + "_start – subscribe & show current state\n")

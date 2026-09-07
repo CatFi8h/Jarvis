@@ -14,16 +14,43 @@ parser's messages.
   and/or train number) and can run several at once; searches persist to
   `GR_SEARCHES_FILE` (`gr_searches.json`).
 
+## Telegram Mini App
+
+The GR parser has a button-driven Mini App (no typing): pick a direction → pick
+a date → tap a train from the live list to start watching it. Active watches are
+managed in the same app (check now / stop / book link); seat alerts still arrive
+as chat messages from the watcher loop.
+
+Setup:
+
+1. Telegram requires the app to be served over **public HTTPS**. The bot serves
+   it on `WEBAPP_ADDR` (default `:8090`); front that with a reverse proxy, or
+   for development a tunnel:
+
+   ```sh
+   cloudflared tunnel --url http://localhost:8090
+   # or: ngrok http 8090
+   ```
+
+2. Set `WEBAPP_URL=https://<your-public-host>` in `.env` and restart.
+
+The bot then sets its menu button (next to the message input) to open the app,
+and `/app` (or `/start`) sends an "Open Train Watch" button. Requests are
+authenticated with the Mini App `initData` signature, so the backend knows the
+Telegram user without any login. Unset `WEBAPP_URL` disables the app; text
+commands keep working either way.
+
 ## Layout
 
 ```
 main.go                # config, Telegram listener, command dispatch
 internal/
-  tg/                  # Telegram Bot API client (send + long-poll)
+  tg/                  # Telegram Bot API client (send + long-poll + web_app buttons)
   subs/                # per-chat, per-parser subscriber registry (JSON-persisted)
   parser/              # Parser interface (Name/Run/Handle/StatusLine)
   nike/                # Nike parser
-  gr/                  # GR ticket parser
+  gr/                  # GR ticket parser (+ api.go: structured API for the Mini App)
+  webapp/              # Mini App: static frontend (embedded) + JSON API + initData auth
 ```
 
 ## Run

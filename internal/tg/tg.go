@@ -33,6 +33,52 @@ func (t *Telegram) SendTo(chatID, text string) {
 	resp.Body.Close()
 }
 
+// SendWebAppButton delivers text with a single inline button that opens the
+// Mini App at webURL. Works in private chats.
+func (t *Telegram) SendWebAppButton(chatID, text, btnText, webURL string) {
+	body, _ := json.Marshal(map[string]any{
+		"chat_id": chatID, "text": text, "disable_web_page_preview": true,
+		"reply_markup": map[string]any{
+			"inline_keyboard": [][]map[string]any{{{
+				"text": btnText, "web_app": map[string]string{"url": webURL},
+			}}},
+		},
+	})
+	resp, err := t.HTTP.Post("https://api.telegram.org/bot"+t.Token+"/sendMessage",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Println("[tg] send error:", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// SetMenuButton makes the bot's default menu button (next to the message input)
+// open the Mini App at webURL in every private chat.
+func (t *Telegram) SetMenuButton(btnText, webURL string) error {
+	body, _ := json.Marshal(map[string]any{
+		"menu_button": map[string]any{
+			"type": "web_app", "text": btnText,
+			"web_app": map[string]string{"url": webURL},
+		},
+	})
+	resp, err := t.HTTP.Post("https://api.telegram.org/bot"+t.Token+"/setChatMenuButton",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if !out.OK {
+		return fmt.Errorf("setChatMenuButton: %s", out.Description)
+	}
+	return nil
+}
+
 // Broadcast delivers text to a list of chats.
 func (t *Telegram) Broadcast(chatIDs []string, text string) {
 	for _, id := range chatIDs {

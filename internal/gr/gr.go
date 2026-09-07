@@ -81,8 +81,9 @@ type Config struct {
 	AlertRepeat   time.Duration
 	HeartbeatEver time.Duration
 
-	APIEndpoint string
-	RouteType   int
+	APIEndpoint      string
+	ScheduleEndpoint string
+	RouteType        int
 
 	SearchesFile string
 
@@ -95,16 +96,17 @@ type Config struct {
 
 func loadConfig() (*Config, error) {
 	c := &Config{
-		Passengers:   env("PASSENGERS", "1"),
-		Child:        env("CHILD_PASSENGERS", "0"),
-		Disabled:     env("DISABLED_PASSENGERS", "0"),
-		APIEndpoint:  env("API_ENDPOINT", defaultEndpoint),
-		SearchesFile: env("GR_SEARCHES_FILE", "gr_searches.json"),
-		CurlFile:     env("API_CURL_FILE", "request.curl"),
-		APIURL:       env("API_URL", ""),
-		APIMethod:    env("API_METHOD", ""),
-		APIBody:      env("API_BODY", ""),
-		APIHeaders:   map[string]string{},
+		Passengers:       env("PASSENGERS", "1"),
+		Child:            env("CHILD_PASSENGERS", "0"),
+		Disabled:         env("DISABLED_PASSENGERS", "0"),
+		APIEndpoint:      env("API_ENDPOINT", defaultEndpoint),
+		ScheduleEndpoint: env("SCHEDULE_ENDPOINT", defaultScheduleEndpoint),
+		SearchesFile:     env("GR_SEARCHES_FILE", "gr_searches.json"),
+		CurlFile:         env("API_CURL_FILE", "request.curl"),
+		APIURL:           env("API_URL", ""),
+		APIMethod:        env("API_METHOD", ""),
+		APIBody:          env("API_BODY", ""),
+		APIHeaders:       map[string]string{},
 	}
 	c.RouteType = atoiDefault(env("ROUTE_TYPE", "0"), 0)
 	c.Interval = envDur("CHECK_INTERVAL", 5*time.Minute)
@@ -937,7 +939,7 @@ func (w *Watcher) Handle(chatID, action, args string) string {
 		w.reg.SetHeartbeat(chatID, name, false)
 		return "⏱ GR heartbeat on for this chat."
 	case "trains":
-		return w.handleTrains(args)
+		return w.handleTrains(chatID, args)
 	case "search", "add":
 		return w.handleSearch(chatID, args)
 	case "list":
@@ -953,8 +955,9 @@ func (w *Watcher) Handle(chatID, action, args string) string {
 	}
 }
 
-// handleTrains lists the trains the API returns for a direction+date.
-func (w *Watcher) handleTrains(args string) string {
+// handleTrains lists the scheduled trains for a direction+date (full timetable
+// from schedules/core, seats merged in from ticket-search where known).
+func (w *Watcher) handleTrains(chatID, args string) string {
 	toks := strings.Fields(args)
 	if len(toks) < 2 {
 		return "⚠️ " + usage
@@ -967,27 +970,43 @@ func (w *Watcher) handleTrains(args string) string {
 	if err != nil {
 		return "⚠️ " + err.Error()
 	}
-	rides, err := w.fetchRides(from, to, date)
+	trains, err := w.mergedTrains(chatID, from, to, date)
 	if err != nil {
-		return "⚠️ fetch failed: " + err.Error()
+		return "⚠️ " + err.Error()
 	}
-	if len(rides) == 0 {
+	if len(trains) == 0 {
 		return fmt.Sprintf("No trains returned for %s on %s.", routeLabel(from, to), date)
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "🚆 %s on %s:\n", routeLabel(from, to), date)
-	for i := range rides {
-		r := &rides[i]
-		total, lines := seatInfo(r)
-		seats := "sold out"
-		if total > 0 {
-			seats = fmt.Sprintf("%d seats (%s)", total, strings.Join(lines, ", "))
+	for i := range trains {
+		t := &trains[i]
+		var seats string
+		switch {
+		case !t.SeatsKnown:
+			seats = "seats unknown (sales may not be open)"
+		case t.TotalSeats > 0:
+			parts := make([]string, 0, len(t.Classes))
+			for _, c := range t.Classes {
+				parts = append(parts, fmt.Sprintf("%s: %d @ %g %s", c.Name, c.Seats, c.Price, c.Currency))
+			}
+			seats = fmt.Sprintf("%d seats (%s)", t.TotalSeats, strings.Join(parts, ", "))
+		default:
+			seats = "sold out"
 		}
 		arrive := ""
-		if a := r.arrHHMM(); a != "" {
-			arrive = " → " + a
+		if t.ArrTime != "" {
+			arrive = " → " + t.ArrTime
 		}
-		fmt.Fprintf(&sb, "N%d @ %s%s — %s\n", r.RideNumber, r.hhmm(), arrive, seats)
+		origin := ""
+		if t.Origin != "" {
+			origin = " (from " + t.Origin + ")"
+		}
+		watched := ""
+		if t.Watched {
+			watched = " 👁"
+		}
+		fmt.Fprintf(&sb, "N%d @ %s%s%s — %s%s\n", t.Number, t.DepTime, arrive, origin, seats, watched)
 	}
 	sb.WriteString("\nStart watching one: /gr_search " + dirToken(from) + " " + date + " <HH:MM or train number>")
 	return sb.String()
